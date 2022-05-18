@@ -1,5 +1,4 @@
-# SparseAttn
-Continuous Sparse Attention
+# Continuous Sparse Attention
 
 Exploring the problem space of attention memory complexity, network meta learning, and sparsity with the proposal of a meta operator framework. The meta operator proposed, Ψ, takes a continuous embedding vector φ, and produces a function Φ which operates upon concrete data. For this to be useful in practice, the embedding φ must be continuous with respect to the output function space, and specifies the semantics of the output function, such as kernel size, stride, etc.
 
@@ -9,10 +8,10 @@ This repository contains the code for one case of the operator Ψ, which relies 
 
 The softgate is implemented as
 softgate(x) = 1 / (1 + abs(x / a) ^ b)
-[see desmos](https://www.desmos.com/calculator/grezgrefl4)
+
+ [see desmos](https://www.desmos.com/calculator/grezgrefl4)
 ![graph of softgate](img/softgate.png)
 
 
 As one can see, the width of is continuous w.r.t. a and hardness w.r.t. b, where a and b are φ.
-
 
