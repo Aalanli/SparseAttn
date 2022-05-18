@@ -30,3 +30,10 @@
 *.exe
 *.out
 *.app
+
+# Vscode metadata
+.vscode
+src/cbuild
+extension_cache
+__pycache__
+.ipynb_checkpoints
