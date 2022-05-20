@@ -33,7 +33,7 @@ q = torch.rand(1024, 512, device='cuda')
 k = torch.rand_like(q)
 v = torch.rand_like(q)
 
-y = attnv2_t(q, k, v)
+y = attnv3_t(q, k, v)
 y1 = attn(q, k, v)
 
 torch.allclose(y, y1)
@@ -41,10 +41,11 @@ torch.allclose(y, y1)
 # %%
 constructor = lambda N: (torch.rand(N, 512, device='cuda'), torch.rand_like(q), torch.rand_like(q))
 
-attn_t2 = functools.partial(attnv2_t, halt=32, block_div=1)
+halt = 64
+attn_t2 = functools.partial(attnv2_t, halt=halt, block_div=1)
 attn_t2.__name__ = 'attnv2_t'
 
-attn_t3 = functools.partial(attnv3_t, halt=32, block_div=1)
+attn_t3 = functools.partial(attnv3_t, halt=halt, block_div=1)
 attn_t3.__name__ = 'attnv3_t'
 
 bench([attn_t2, attn_t3], constructor, 16, 8)

@@ -138,23 +138,22 @@ __global__ void simple_attn_v2_t(
 
     float4* K4 = (float4*) K;
     float4* q_mem4 = (float4*) q_mem;
+    const T norm = sqrtf(D);
 
     for (int q_row = 0; q_row < L; q_row += gridDim.x) {
         const int idq = q_row + qid;
-        const bool nskip = idq < L;
+        if (idq >= L) {break;};
         T y_mem = 0;
-        if (nskip)
-            q_mem[tid] = Q[idq * D + tid];
+        q_mem[tid] = Q[idq * D + tid];
         __syncthreads();
         
-        const T norm = sqrtf(D);
         T max = -1.0 / 0.0;
         T sum = 0;
 
         for (int r = 0; r < halt; r += sta) {
             int col_a = r + idy;
             T a_val = 0;
-            if (col_a < halt && nskip) {
+            if (col_a < halt) {
                 #pragma unroll
                 for (int i = 0; i < D / 4; i += tile) {
                     a_val += mul_accum(q_mem4[i + idx], K4[col_a * (D / 4) + i + idx]);
@@ -167,7 +166,7 @@ __global__ void simple_attn_v2_t(
             __syncthreads();
             #pragma unroll
             for (int i = 0; i < sta; i++) {
-                if (i + r < halt && nskip) {
+                if (i + r < halt) {
                     T a = a_mem[i] / norm;
                     T cur_max = fmaxf(max, a);
                     T scale = expf(max - cur_max);
@@ -180,10 +179,13 @@ __global__ void simple_attn_v2_t(
             __syncthreads();
         }
 
-        if (tid < D && nskip) {Y[idq * D + tid] = y_mem / sum;}
+        Y[idq * D + tid] = y_mem / sum;
     }
 }
 
+// unrolls the last step
+// unfortunately, this does not work well for lower halts,
+// not enough to justify the tiny performance gain for larger halts
 template <int tile, int D>
 __global__ void simple_attn_v3_t(
     const T* __restrict__ Q, // Q.shape = [L, D]
@@ -209,28 +211,27 @@ __global__ void simple_attn_v3_t(
 
     float4* K4 = (float4*) K;
     float4* q_mem4 = (float4*) q_mem;
+    const T norm = sqrtf(D);
 
     for (int q_row = 0; q_row < L; q_row += gridDim.x) {
         const int idq = q_row + qid;
-        const bool nskip = idq < L;
+        if (idq >= L) {break;} // okay to break here since all threads do the same thing
         T y_mem = 0;
-        if (nskip)
-            q_mem[tid] = Q[idq * D + tid];
+        q_mem[tid] = Q[idq * D + tid];
         __syncthreads();
         
-        const T norm = sqrtf(D);
         T max = -1.0 / 0.0;
         T sum = 0;
 
-        for (int r = 0; r < halt; r += sta) {
+        // unroll to remove bounds checks
+        for (int r = 0; r < halt - sta; r += sta) {
             int col_a = r + idy;
             T a_val = 0;
-            if (col_a < halt && nskip) {
-                #pragma unroll
-                for (int i = 0; i < D / 4; i += tile) {
-                    a_val += mul_accum(q_mem4[i + idx], K4[col_a * (D / 4) + i + idx]);
-                }
+            #pragma unroll
+            for (int i = 0; i < D / 4; i += tile) {
+                a_val += mul_accum(q_mem4[i + idx], K4[col_a * (D / 4) + i + idx]);
             }
+            
             a_val = reduce_sum_tile_shuffle<tile>(tgp, a_val);
             if (idx == 0) {
                 a_mem[idy] = a_val;
@@ -238,26 +239,45 @@ __global__ void simple_attn_v3_t(
             __syncthreads();
             #pragma unroll
             for (int i = 0; i < sta; i++) {
-                if (i + r < halt && nskip) {
-                    T a = a_mem[i] / norm;
-                    if (max < a) { // a is the maximum
-                        T scale = expf(max - a);
-                        max = a;
-                        a = 1;
-                        sum *= scale;
-                        y_mem *= scale;
-                    }
-                    else {
-                        a = expf(a - max);
-                    }
-                    y_mem += a * V[(r + i) * D + tid];   
-                    sum += a;
-                }
+                T a = a_mem[i] / norm;
+                T cur_max = fmaxf(max, a);
+                T scale = expf(max - cur_max);
+                a = expf(a - cur_max);
+                y_mem = y_mem * scale + a * V[(r + i) * D + tid];   
+                sum = scale * sum + a;
+                max = cur_max;
             }
             __syncthreads();
         }
+        int r = halt - sta;
+        int col_a = r + idy;
+        T a_val = 0;
+        if (col_a < halt) {
+            #pragma unroll
+            for (int i = 0; i < D / 4; i += tile) {
+                a_val += mul_accum(q_mem4[i + idx], K4[col_a * (D / 4) + i + idx]);
+            }
+        }
+        a_val = reduce_sum_tile_shuffle<tile>(tgp, a_val);
+        if (idx == 0) {
+            a_mem[idy] = a_val;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < sta; i++) {
+            if (i - sta < 0) {
+                T a = a_mem[i] / norm;
+                T cur_max = fmaxf(max, a);
+                T scale = expf(max - cur_max);
+                a = expf(a - cur_max);
+                y_mem = y_mem * scale + a * V[(r + i) * D + tid];   
+                sum = scale * sum + a;
+                max = cur_max;
+            }
+        }
+        __syncthreads();
 
-        if (tid < D && nskip) {Y[idq * D + tid] = y_mem / sum;}
+         Y[idq * D + tid] = y_mem / sum;
     }
 }
 
@@ -351,7 +371,7 @@ int main() {
     auto q = torch::rand({1024, 512}).cuda();
     auto k = torch::rand_like(q);
     auto v = torch::rand_like(q);
-    auto y = simple_attn(q, k, v);
+    auto y = attnv3_t(q, k, v, 2, -1);
     ut::cudaLastError();
 }
 
