@@ -33,6 +33,7 @@ __global__ void attn_impl_kernel(
     auto gp = cg::this_thread_block();
     auto tgp = cg::tiled_partition<tile>(gp);
 
+    const int mstart = blockIdx.y * L * D;
     const int qid = blockIdx.x;
     const int tid = threadIdx.x;
 
@@ -44,7 +45,7 @@ __global__ void attn_impl_kernel(
     __shared__ T q_mem[D]; // q_mem.shape = [D]
     __shared__ T a_mem[D / tile];
 
-    float4* K4 = (float4*) K;
+    float4* K4 = (float4*) K + mstart / 4;
     float4* q_mem4 = (float4*) q_mem;
     const T norm = sqrtf(D);
 
@@ -52,7 +53,7 @@ __global__ void attn_impl_kernel(
         const int idq = q_row + qid;
         if (idq >= L) {break;};
         T y_mem = 0;
-        q_mem[tid] = Q[idq * D + tid];
+        q_mem[tid] = Q[mstart + idq * D + tid];
         __syncthreads();
         
         T max = -1.0 / 0.0;
@@ -79,7 +80,7 @@ __global__ void attn_impl_kernel(
                     T cur_max = fmaxf(max, a);
                     T scale = expf(max - cur_max);
                     a = expf(a - cur_max);
-                    y_mem = y_mem * scale + a * V[(r + i) * D + tid];   
+                    y_mem = y_mem * scale + a * V[mstart + (r + i) * D + tid];   
                     sum = scale * sum + a;
                     max = cur_max;
                 }
@@ -87,11 +88,11 @@ __global__ void attn_impl_kernel(
             __syncthreads();
         }
 
-        Y[idq * D + tid] = y_mem / sum;
+        Y[mstart + idq * D + tid] = y_mem / sum;
         if (tid == 0)
-            row_max[idq] = max;
+            row_max[blockIdx.y * L + idq] = max;
         if (tid == 1)
-            row_sum[idq] = sum;
+            row_sum[blockIdx.y * L + idq] = sum;
     }
 }
 
@@ -102,6 +103,11 @@ auto like_tensor(const torch::Tensor &a) {
 }
 
 
+inline int n_elements(const torch::Tensor &a) {
+    return a.size(0) * a.stride(0);
+}
+
+
 std::vector<torch::Tensor> attn(
     torch::Tensor Q,
     torch::Tensor K,
@@ -109,20 +115,23 @@ std::vector<torch::Tensor> attn(
     int block_div,
     int halt)
 {
-    const int L = Q.size(0);
-    const int D = Q.size(1);
+    auto sizes = Q.sizes();
+    sizes = sizes.slice(0, sizes.size()-1);
+    const int L = Q.size(-2);
+    const int D = Q.size(-1);
+    const int matrices = n_elements(Q) / (L * D);
+
     auto opt = like_tensor(Q);
     auto Y = torch::empty_like(Q);
-    auto row_max = torch::empty({L}, opt);
-    auto row_sum = torch::empty({L}, opt);
-    
+    auto row_max = torch::empty(sizes, opt);
+    auto row_sum = torch::empty(sizes, opt);
 
     if (halt < 1) {
         halt = L;
     } 
 
     const dim3 threads(512, 1, 1);
-    const dim3 blocks(L / block_div, 1, 1);
+    const dim3 blocks(L / block_div, matrices, 1);
     attn_impl_kernel<4, 512><<<blocks, threads>>>(
         Q.data_ptr<T>(),
         K.data_ptr<T>(),
@@ -139,7 +148,7 @@ std::vector<torch::Tensor> attn(
 #ifndef PyExtension
 
 int main() {
-    auto q = torch::rand({1024, 512}).cuda();
+    auto q = torch::rand({2, 1024, 512}).cuda();
     auto k = torch::rand_like(q);
     auto v = torch::rand_like(q);
     auto y = attn(q, k, v, 2, -1);

@@ -10,7 +10,7 @@ def attn_cuda(q, k, v, block_div=1, halt=-1):
     return ext.attn(q, k, v, block_div, halt)
 
 def attn(q, k, v):
-    a1 = q @ k.t()
+    a1 = q @ k.transpose(-1, -2)
     a1 /= math.sqrt(q.shape[-1])
     a1: torch.Tensor
     rmax = torch.max(a1, -1).values
@@ -23,12 +23,12 @@ def simple_attn(q, k, v):
     a1 = q @ k.t()
     return a1 @ v
 
-q = torch.rand(1024, 512, device='cuda')
+q = torch.rand(2, 1024, 512, device='cuda')
 k = torch.rand_like(q)
 v = torch.rand_like(q)
 
-y = attn_cuda(q, k, v)
 y1 = attn(q, k, v)
+y = attn_cuda(q, k, v)
 
 for i in range(len(y)):
     print(torch.allclose(y[i], y1[i]))
