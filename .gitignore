@@ -37,3 +37,4 @@ src/cbuild
 extension_cache
 __pycache__
 .ipynb_checkpoints
+paper/**
