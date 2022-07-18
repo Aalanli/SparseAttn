@@ -234,7 +234,8 @@ __global__ void d_gated_softmax_v3_kernel(
     PartialAccumulations<T> dot;
     dot.zero_();
 
-    extern __shared__ T smem[]; // smem.shape = [2 * L]
+    extern __shared__ char temp_mem[]; // smem.shape = [2 * L]
+    T* smem = (T*) temp_mem;
     // shift pointers to the correct row, may not be necessarily more efficient
     const T* y_row = y + row_id * D;
     const T* grad_row = grad + row_id * D;
