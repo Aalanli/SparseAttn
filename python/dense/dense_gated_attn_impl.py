@@ -4,7 +4,9 @@ from torch.autograd import Function
 import triton
 import triton.language as tl
 
+from gated_attn import d_gated_dense_softmax_cuda
 
+# %%
 def gated_softmax_torch(x, eps, beta):
     indices = torch.arange(0, x.shape[-1], 1, dtype=x.dtype, device=x.device)
     indices = indices.repeat(x.shape[-1], 1) - indices[:, None]
@@ -30,6 +32,20 @@ def d_gated_softmax_torch(grad, y, eps, beta):
     return dy_dx, dy_de
     
 
+grad = torch.rand(512, 512, device='cuda')
+y = torch.rand_like(grad)
+eps = torch.rand(512, 2, device='cuda')
+beta = 2.0
+
+dydx1, dyde1 = d_gated_softmax_torch(grad, y, eps, beta)
+dydx2, dyde2 = d_gated_dense_softmax_cuda(grad, y, eps, beta, 2)
+
+print(torch.allclose(dydx1, dydx2))
+print(torch.allclose(dyde1, dyde2))
+
+
+
+# %%
 @triton.jit
 def soft_gate(x, a, b):
     return 1 / (1 + tl.exp(b * (x - a)) + tl.exp(-b * (x + a)))
