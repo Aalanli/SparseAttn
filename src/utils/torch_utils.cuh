@@ -50,9 +50,9 @@ std::string construct_runtime_str(T val, Args... args) {
 }
 
 template <typename... Args>
-size_t construct_runtime_id(Args... args) {
+size_t construct_runtime_id(int ver, Args... args) {
     std::hash<std::string> hasher;
-    return hasher(construct_runtime_str(args...));
+    return hasher(std::to_string(ver) + construct_runtime_str(args...));
 }
 
 

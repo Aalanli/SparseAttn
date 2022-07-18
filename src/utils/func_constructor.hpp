@@ -66,12 +66,6 @@ namespace aux {
     }
 
     template <typename Seq>
-    size_t get_default_id() {
-        std::hash<std::string> hasher;
-        return hasher(get_default_str<Seq>());
-    }
-
-    template <typename Seq>
     size_t get_default_id(int ver) {
         std::hash<std::string> hasher;
         return hasher(std::to_string(ver) + get_default_str<Seq>());
@@ -104,7 +98,7 @@ namespace aux {
         static void build_func_(Map &map, int ver) {
             using front = typename mpl::front<Seq>::type;
             using fn_t  = typename ApplyArgs<front, Fn>::type;
-            size_t id = id_switcher<fn_t, Seq>(has_id_fn<fn_t>{}, ver);
+            size_t id = id_switcher<fn_t, front>(has_id_fn<fn_t>{}, ver);            
             map[id] = &fn_t::fn;
 
             using back = typename mpl::pop_front<Seq>::type;

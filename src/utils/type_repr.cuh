@@ -5,7 +5,7 @@ namespace type_repr {
 
 template <typename T>
 std::string to_std_type_str() {
-    return std::string(typeid(T).name());
+    throw std::runtime_error("no default conversion from type to str");
 }
 
 template <>
