@@ -1,6 +1,9 @@
 #pragma once
+#ifdef IS_EXECUTABLE
 #include "ops.cuh"
-
+#else
+#include "utils/ops.cuh"
+#endif
 
 #define FULLMASK 0xffffffff
 
