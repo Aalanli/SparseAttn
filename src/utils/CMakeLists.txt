@@ -6,6 +6,7 @@ target_sources(main
         torch_utils.cuh
         utils.cuh
         ops.cuh
+        type_repr.cuh
 )
 
 find_package(Torch REQUIRED)
