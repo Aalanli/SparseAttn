@@ -4,8 +4,54 @@
 #else
 #include "utils/ops.cuh"
 #endif
+#include <cub/cub.cuh>
 
 #define FULLMASK 0xffffffff
+
+template <typename T, int threads>
+__global__ void softmax_ref_kernel(
+    const T* __restrict__ X,
+    T* __restrict__ Y,
+    const int D)
+{
+    constexpr int warps = threads / 32;
+    const int row_id = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int warp_rank = tid % 32;
+    using BlockReducer = cub::BlockReduce<T, threads>;
+    __shared__ typename BlockReducer::TempStorage smem;
+
+    T max_ = -1.0 / 0.0; // -inf
+    const T* x_row = X + row_id * D;
+    T* y_row = Y + row_id * D;
+    for (int i = tid; i < D; i += threads) {
+        max_ = max(max_, x_row[i]);
+    }
+    
+    __shared__ T sval;
+    max_ = BlockReducer(smem).Reduce(max_, cub::Max());
+    if (tid == 0) {sval = max_;}
+    __syncthreads();
+    max_ = sval;
+
+    T sum = 0;
+    for (int i = tid; i < D; i += threads) {
+        T temp = __expf(x_row[i] - max_);
+        sum += temp;
+        y_row[i] = temp;
+    }
+
+    sum = BlockReducer(smem).Sum(sum);
+    if (tid == 0) {sval = sum;}
+    __syncthreads();
+    sum = sval;
+
+    for (int i = tid; i < D; i += threads) {
+        y_row[i] /= sum;
+    }
+
+}
 
 // version 1 of the kernel accesses global memory four times, twice for computing the dot-product between
 // y and eps, and twice for computing the derivative of softmax and gating functions
@@ -28,13 +74,14 @@ __global__ void d_gated_softmax_v1_kernel(
 
     const T alpha = eps[row_id * 2];
     const T shift = eps[row_id * 2 + 1];
+    const T head_rank = row_id % L;
 
     T dot;
 
     // shift pointers to the correct row, may not be necessarily more efficient
     const T* y_row = y + row_id * D;
     const T* grad_row = grad + row_id * D;
-    for (int i = tid; i < L; i += threads) {
+    for (int i = tid; i < D; i += threads) {
         T yi = y_row[i];
         T gi = grad_row[i];
         dot += yi * gi;
@@ -45,7 +92,7 @@ __global__ void d_gated_softmax_v1_kernel(
         // first reduce across each warp
         dot = ops::reduce_sum_shfl_down<32>(dot, FULLMASK);
         if (warp_rank == 0) {
-            s_pool[warp_rank] = dot;
+            s_pool[warp_id] = dot;
         }
         __syncthreads();
     
@@ -63,27 +110,30 @@ __global__ void d_gated_softmax_v1_kernel(
     // broadcast back to all threads the results
     __syncthreads();
     dot = s_pool[0];
-    T dy_de_[2] = {};
+    T dy_de_[2] = {0, 0};
     // calculate dy_dx and dy_de
     {
         T* dy_dx_row = dy_dx + row_id * D;
-        for (int i = tid; i < L; i += threads) {
+        for (int i = tid; i < D; i += threads) {
             T yi = y_row[i];
             T gi = grad_row[i];
             T dy_dx_temp = yi * (gi - dot);
+            T index = T(i) - shift - head_rank;
+            T w = ops::softgate(index, alpha, beta);
             dy_dx_row[i] = dy_dx_temp;
-            T w = ops::softgate(T(i) - shift, alpha, beta);
             T temp = (1 - w) * dy_dx_temp;
             dy_de_[0] += temp;
-            dy_de_[1] += temp * tanh(beta * T(i));
+            dy_de_[1] += temp * tanh(beta * index);
         }
     }
     // now accumulate the partial derivatives of dy_de
     {
-        ops::reduce_sum_shfl_down_vec<32, T, 2>(dy_de_, FULLMASK);
+        //ops::reduce_sum_shfl_down_vec<32, T, 2>(dy_de_, FULLMASK);
+        dy_de_[0] = ops::reduce_sum_shfl_down<32>(dy_de_[0], FULLMASK);
+        dy_de_[1] = ops::reduce_sum_shfl_down<32>(dy_de_[1], FULLMASK);
         if (warp_rank == 0) {
-            s_pool[warp_rank] = dy_de_[0];
-            s_pool[warps + warp_rank] = dy_de_[1];
+            s_pool[warp_id] = dy_de_[0];
+            s_pool[warps + warp_id] = dy_de_[1];
         }
         __syncthreads();
     
@@ -92,10 +142,11 @@ __global__ void d_gated_softmax_v1_kernel(
             // now reduce across the mem-pool
             dy_de_[0] = s_pool[tid];
             dy_de_[1] = s_pool[warps + tid];
-            ops::reduce_sum_shfl_down_vec<warps, T, 2>(dy_de_, mask);
+            dy_de_[0] = ops::reduce_sum_shfl_down<warps>(dy_de_[0], mask);
+            dy_de_[1] = ops::reduce_sum_shfl_down<warps>(dy_de_[1], mask);
             if (tid == 0) {
-                dy_de[row_id * 2] = dy_de_[0];
-                dy_de[row_id * 2 + 1] = dy_de_[1];
+                dy_de[row_id * 2] = dy_de_[0] * beta;
+                dy_de[row_id * 2 + 1] = dy_de_[1] * beta;
             }
         }
     }
@@ -148,6 +199,7 @@ __global__ void d_gated_softmax_v2_kernel(
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
     const int warp_rank = tid % 32;
+    const T head_rank = row_id % L;
 
     const T alpha = eps[row_id * 2];
     const T shift = eps[row_id * 2 + 1];
@@ -164,11 +216,12 @@ __global__ void d_gated_softmax_v2_kernel(
         T gi = grad_row[i];
         dot.dot_1 += yi * gi;
 
-        T w = ops::softgate(T(i) - shift, alpha, beta);
+        T index = T(i) - shift - head_rank;
+        T w = ops::softgate(index, alpha, beta);
         T temp = (1 - w) * yi;
         dot.dy_da_1 += temp * gi;
         dot.dy_da_2 += temp;
-        temp *= tanh(beta * T(i));
+        temp *= tanh(beta * index);
         dot.dy_ds_1 += temp * gi;
         dot.dy_ds_2 += temp;
     }
@@ -179,7 +232,7 @@ __global__ void d_gated_softmax_v2_kernel(
         // first reduce across each warp
         dot.warp_shfl_down_sum<32>(FULLMASK);
         if (warp_rank == 0) {
-            s_pool[warp_rank] = dot;
+            s_pool[warp_id] = dot;
         }
         __syncthreads();
     
@@ -190,10 +243,8 @@ __global__ void d_gated_softmax_v2_kernel(
             dot.warp_shfl_down_sum<warps>(mask);
             if (tid == 0) {
                 dot_product = dot.dot_1;
-            } else if (tid == 1) {
-                dy_de[row_id * 2] = dot.dy_da_1 - dot.dy_da_2 * dot.dot_1;
-            } else if (tid == 2) {
-                dy_de[row_id * 2 + 1] = dot.dy_ds_1 - dot.dy_ds_2 * dot.dot_1;
+                dy_de[row_id * 2] = (dot.dy_da_1 - dot.dy_da_2 * dot.dot_1) * beta;
+                dy_de[row_id * 2 + 1] = (dot.dy_ds_1 - dot.dy_ds_2 * dot.dot_1) * beta;
             }
         }
         // now dot-product is accumulated in dot_product

@@ -29,10 +29,28 @@ __device__ T reduce_sum_shfl_down(cg::thread_block_tile<tile_sz> g, T val) {
 }
 
 template <int tile_sz, typename T>
+__device__ T reduce_max_shfl_down(cg::thread_block_tile<tile_sz> g, T val) {
+    #pragma unroll
+    for (int i = g.size() / 2; i > 0; i /= 2) {
+        val = max(val, g.shfl_down(val, i));
+    }
+    return val;
+}
+
+template <int tile_sz, typename T>
 __device__ __forceinline__ T reduce_sum_shfl_down(T val, unsigned mask) {
     #pragma unroll
     for (int i = tile_sz / 2; i > 0; i /= 2) {
         val += __shfl_down_sync(mask, val, i, tile_sz);
+    }
+    return val;
+}
+
+template <int tile_sz, typename T>
+__device__ __forceinline__ T reduce_max_shfl_down(T val, unsigned mask) {
+    #pragma unroll
+    for (int i = tile_sz / 2; i > 0; i /= 2) {
+        val = max(val, __shfl_down_sync(mask, val, i, tile_sz));
     }
     return val;
 }

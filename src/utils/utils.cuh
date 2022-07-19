@@ -41,4 +41,13 @@ std::tuple<bool, std::string> cudaErrorState() {
     return std::tuple<bool, std::string>(success, cudaGetErrorString(code1));
 }
 
+int reduction_switcher(int reduce_dim, int max_elem) {
+    for (int warp = 32; warp >= 1; warp /= 2, max_elem /= 2) {
+        if (reduce_dim >= max_elem) {
+            return warp;
+        }
+    }
+    return 1;
+}
+
 }
