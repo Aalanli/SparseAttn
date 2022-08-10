@@ -4,9 +4,7 @@ from torch.autograd import Function
 import triton
 import triton.language as tl
 
-from gated_attn import d_gated_dense_softmax_cuda
 
-# %%
 def gated_softmax_torch(x, eps, beta):
     indices = torch.arange(0, x.shape[-1], 1, dtype=x.dtype, device=x.device)
     indices = indices.repeat(x.shape[-1], 1) - indices[:, None]
@@ -22,7 +20,7 @@ def d_gated_softmax_torch(grad, y, eps, beta):
     dy_dx = y * (grad - g_sum[:, None])
 
     indices = torch.arange(0, grad.shape[-1], 1, dtype=y.dtype, device=y.device)
-    indices = indices.repeat(grad.shape[-1], 1) - indices[:, None]
+    indices = indices.repeat(grad.shape[-2], 1) - indices[:grad.shape[-2], None]
     indices = indices - eps[:, 1:2]
     w = 1 / (1 + (beta * (indices - eps[:, 0:1])).exp() + (-beta * (indices + eps[:, 0:1])).exp())
     
@@ -30,25 +28,20 @@ def d_gated_softmax_torch(grad, y, eps, beta):
     dy_de[:, 0] = (beta * (1 - w) * dy_dx).sum(-1)
     dy_de[:, 1] = (-beta * (w - 1) * torch.tanh(beta * indices) * dy_dx).sum(-1)
     return dy_dx, dy_de
-    
-
-grad = torch.rand(512, 512, device='cuda')
-y = torch.rand_like(grad)
-eps = torch.rand(512, 2, device='cuda')
-beta = 2.0
-
-dydx1, dyde1 = d_gated_softmax_torch(grad, y, eps, beta)
-dydx2, dyde2 = d_gated_dense_softmax_cuda(grad, y, eps, beta, 2)
-
-print(torch.allclose(dydx1, dydx2))
-print(torch.allclose(dyde1, dyde2))
-
 
 
 # %%
 @triton.jit
 def soft_gate(x, a, b):
     return 1 / (1 + tl.exp(b * (x - a)) + tl.exp(-b * (x + a)))
+
+@triton.jit
+def sigmoid(x):
+        return 1 / (1 + tl.exp(-x))
+
+@triton.jit
+def tanh(x):
+    return 2 * sigmoid(2 * x) - 1 
 
 
 @triton.jit
@@ -90,22 +83,34 @@ def gated_softmax_v1(X: torch.Tensor, epsilion: torch.Tensor, beta, causal=False
 
 # triton does not support tanh, so backward gradients are not as accurate as they can be
 @triton.jit
-def d_gated_softmax_kernel_v1(grad_ptr, y_ptr, eps_ptr, dx_ptr, de_ptr, beta, D, BLOCK_D: tl.constexpr, causal: tl.constexpr):
+def d_gated_softmax_kernel_v1(
+        grad_ptr,               # [..., L, L] 
+        y_ptr,                  # [..., L, L]
+        eps_ptr,                # [..., L, 2]
+        dx_ptr,                 # [..., L, L]
+        de_ptr,                 # [..., L, 2]
+        beta,                   # [1]
+        L,                      # int
+        BLOCK_L: tl.constexpr,  # int 
+        causal: tl.constexpr    # bool
+    ):
     idr = tl.program_id(0)
     
-    block = tl.arange(0, BLOCK_D)
-    if causal:
-        causal_mask = block <= (idr % D)
+    block = tl.arange(0, BLOCK_L)
+    if causal:  # apply casual triangular masking
+        attn_mask = block <= (idr % L)
+        store_mask = block < L  # make separate store mask in case dy_ptr is not initialized with zeros
     else:
-        causal_mask = block < D
-        mask = causal_mask
-    row = block + idr * D
+        attn_mask = block < L
+        store_mask = attn_mask
+    row = block + idr * L
 
-    grad = tl.load(grad_ptr + row, causal_mask, 0)
-    Y = tl.load(y_ptr + row, causal_mask, 0)
+    grad = tl.load(grad_ptr + row, attn_mask, other=0)
+    Y = tl.load(y_ptr + row, attn_mask, other=0)
     g_sum = tl.sum(grad * Y, 0)
+    # basically the softmax derivative
     dy_dx = Y * (grad - g_sum)
-    tl.store(dx_ptr + row, dy_dx, mask)
+    tl.store(dx_ptr + row, dy_dx, store_mask)
 
     alpha = tl.load(eps_ptr + idr * 2)
     shift = tl.load(eps_ptr + idr * 2 + 1)
@@ -113,17 +118,13 @@ def d_gated_softmax_kernel_v1(grad_ptr, y_ptr, eps_ptr, dx_ptr, de_ptr, beta, D,
     center = idr.to(tl.float32)
     indices = block.to(tl.float32) - (center + shift)
 
-    e1 = tl.exp(beta_ * indices)
-    e2 = tl.exp(beta_ * alpha)
+    w = soft_gate(indices, alpha, beta_)
+    dy_da = beta * (1 - w) * dy_dx
 
-    w = 1 - (1 / (1 + (1 / e2) * (e1 + (1 / e1))))
-    h = 2 / (1 + e1 * (e1 + e2))
+    tl.store(de_ptr + idr * 2, tl.sum(dy_da, 0))
 
-    dy_da = beta_ * tl.sum(dy_dx * w, 0)
-    dy_ds = dy_da - beta_ * tl.sum(dy_dx * h, 0)
-
-    tl.store(de_ptr + idr * 2, dy_da)
-    tl.store(de_ptr + idr * 2 + 1, dy_ds)
+    dy_ds = tanh(beta * indices) * dy_da
+    tl.store(de_ptr + idr * 2 + 1, tl.sum(dy_ds, 0))
 
 
 def d_gated_softmax_v1(grad, Y: torch.Tensor, epsilion: torch.Tensor, beta, causal=False):
