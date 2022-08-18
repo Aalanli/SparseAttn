@@ -38,3 +38,6 @@ extension_cache
 __pycache__
 .ipynb_checkpoints
 paper/**
+build
+dist
+*.egg-info

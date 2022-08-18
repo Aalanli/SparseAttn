@@ -119,11 +119,11 @@ def d_gated_softmax_kernel_v1(
     indices = block.to(tl.float32) - (center + shift)
 
     w = soft_gate(indices, alpha, beta_)
-    dy_da = beta * (1 - w) * dy_dx
+    dy_da = beta_ * (1 - w) * dy_dx
 
     tl.store(de_ptr + idr * 2, tl.sum(dy_da, 0))
 
-    dy_ds = tanh(beta * indices) * dy_da
+    dy_ds = tanh(beta_ * indices) * dy_da
     tl.store(de_ptr + idr * 2 + 1, tl.sum(dy_ds, 0))
 
 
@@ -153,4 +153,18 @@ class GatedSoftmax(Function):
         #dx, de = d_gated_softmax_v1(grad, y, eps, beta, ctx.causal)
         dx, de = d_gated_softmax_v1(grad, y, eps, beta)
         return dx, de, None, None
+
+
+g = torch.randn(1024, 1024, device='cuda')
+y = torch.randn(1024, 1024, device='cuda')
+eps = torch.randn(1024, 2).cuda()
+beta = torch.tensor([5]).cuda()
+
+dx1, de1 = d_gated_softmax_torch(g, y, eps, beta)
+dx2, de2 = d_gated_softmax_v1(g, y, eps, beta)
+
+print((dx1 - dx2).abs().max())
+print((de1[:, 0] - de2[:, 0]).abs().max())
+print(torch.allclose(dx1, dx2))
+print(torch.allclose(de1, de2))
 
